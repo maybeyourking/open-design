@@ -30,7 +30,8 @@
 //   * provider 'imagerouter'→ ImageRouter OpenAI-compatible image/video
 //                              generation endpoints
 //   * provider 'custom-image'→ user-supplied OpenAI-compatible
-//                              /v1/images/generations endpoint
+//                              /v1/images/generations + /v1/images/edits
+//                              endpoints
 //
 // The fallback stub handlers are gated behind OD_MEDIA_ALLOW_STUBS=1; in
 // release builds they throw StubProviderDisabledError (mapped to HTTP
@@ -850,7 +851,7 @@ async function renderCustomOpenAIImage(ctx: MediaContext, credentials: ProviderC
   const baseUrl = (credentials.baseUrl || '').trim();
   if (!baseUrl) {
     throw new Error(
-      'Custom Image API base URL required — configure a /v1/images/generations compatible endpoint in Settings',
+      'Custom Image API base URL required — configure an OpenAI-compatible /v1/images/generations or /v1/images/edits endpoint in Settings',
     );
   }
   const wireModel = (
@@ -875,8 +876,14 @@ async function renderCustomOpenAIImage(ctx: MediaContext, credentials: ProviderC
     n: 1,
     size: openaiSizeFor('gpt-image-1', ctx.aspect),
   };
+  let url = buildOpenAIImageUrl(baseUrl, false);
+  if (ctx.imageRef?.dataUrl) {
+    body.response_format = 'b64_json';
+    body.images = [{ image_url: ctx.imageRef.dataUrl }];
+    url = buildOpenAIImageEditUrl(baseUrl);
+  }
 
-  const resp = await fetch(buildOpenAIImageUrl(baseUrl, false), {
+  const resp = await fetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -999,6 +1006,25 @@ function buildOpenAIImageUrl(baseUrl: string, isAzure: boolean): string {
   }
   if (isAzure && !parsed.searchParams.has('api-version')) {
     parsed.searchParams.set('api-version', AZURE_DEFAULT_API_VERSION);
+  }
+  return parsed.toString();
+}
+
+function buildOpenAIImageEditUrl(baseUrl: string): string {
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    const stripped = baseUrl.replace(/\/$/, '');
+    return stripped.endsWith('/images/edits') ? stripped : `${stripped}/images/edits`;
+  }
+  const strippedPath = parsed.pathname.replace(/\/+$/, '');
+  if (!strippedPath.endsWith('/images/edits')) {
+    if (strippedPath.endsWith('/images/generations')) {
+      parsed.pathname = `${strippedPath.slice(0, -'/images/generations'.length)}/images/edits`;
+    } else {
+      parsed.pathname = `${strippedPath}/images/edits`;
+    }
   }
   return parsed.toString();
 }
