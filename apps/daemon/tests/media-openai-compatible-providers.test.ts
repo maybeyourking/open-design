@@ -158,6 +158,54 @@ describe('OpenAI-compatible media providers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('rewrites custom-image text-only requests back to /v1/images/generations when configured with an edits URL', async () => {
+    await writeConfig({
+      providers: {
+        'custom-image': {
+          apiKey: 'proxy-test-key',
+          baseUrl: 'https://proxy.example.test/v1/images/edits',
+          model: 'acme-image-model',
+        },
+      },
+    });
+
+    const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
+      expect(String(input)).toBe('https://proxy.example.test/v1/images/generations');
+      expect(init?.method).toBe('POST');
+      expect(init?.headers).toMatchObject({
+        authorization: 'Bearer proxy-test-key',
+        'content-type': 'application/json',
+      });
+      expect(JSON.parse(String(init?.body))).toEqual({
+        prompt: 'A matte product shot on a neutral backdrop',
+        model: 'acme-image-model',
+        n: 1,
+        size: '1024x1024',
+      });
+      return new Response(JSON.stringify({
+        data: [{ b64_json: PNG_BASE64 }],
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await generateMedia({
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+      surface: 'image',
+      model: 'custom-image',
+      prompt: 'A matte product shot on a neutral backdrop',
+      output: 'custom-from-edits-base.png',
+    });
+
+    expect(result.providerId).toBe('custom-image');
+    expect(result.providerNote).toContain('custom-image/acme-image-model');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('routes custom-image reference-image requests through /v1/images/edits', async () => {
     await writeConfig({
       providers: {
