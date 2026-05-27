@@ -979,19 +979,34 @@ function detectAzureEndpoint(baseUrl: string): boolean {
  * appending the default api-version for Azure when the user didn't
  * specify one. Returns a string ready for `fetch`.
  */
+function normalizeOpenAICompatiblePath(pathname: string, endpoint: 'images' | 'videos', mode: 'generations' | 'edits'): string {
+  const strippedPath = pathname.replace(/\/+$/, '');
+  const generationsSuffix = `/${endpoint}/generations`;
+  const editsSuffix = endpoint === 'images' ? '/images/edits' : null;
+  if (strippedPath.endsWith(generationsSuffix)) {
+    if (mode === 'generations') return strippedPath;
+    return endpoint === 'images'
+      ? `${strippedPath.slice(0, -generationsSuffix.length)}${editsSuffix}`
+      : strippedPath;
+  }
+  if (editsSuffix && strippedPath.endsWith(editsSuffix)) {
+    if (mode === 'edits') return strippedPath;
+    return `${strippedPath.slice(0, -editsSuffix.length)}${generationsSuffix}`;
+  }
+  return mode === 'edits' && editsSuffix
+    ? `${strippedPath}${editsSuffix}`
+    : `${strippedPath}${generationsSuffix}`;
+}
+
 function buildOpenAICompatibleGenerationUrl(baseUrl: string, endpoint: 'images' | 'videos'): string {
-  const suffix = `/${endpoint}/generations`;
   let parsed;
   try {
     parsed = new URL(baseUrl);
   } catch {
     const stripped = baseUrl.replace(/\/$/, '');
-    return stripped.endsWith(suffix) ? stripped : `${stripped}${suffix}`;
+    return normalizeOpenAICompatiblePath(stripped, endpoint, 'generations');
   }
-  const strippedPath = parsed.pathname.replace(/\/+$/, '');
-  if (!strippedPath.endsWith(suffix)) {
-    parsed.pathname = `${strippedPath}${suffix}`;
-  }
+  parsed.pathname = normalizeOpenAICompatiblePath(parsed.pathname, endpoint, 'generations');
   return parsed.toString();
 }
 
@@ -1016,16 +1031,9 @@ function buildOpenAIImageEditUrl(baseUrl: string): string {
     parsed = new URL(baseUrl);
   } catch {
     const stripped = baseUrl.replace(/\/$/, '');
-    return stripped.endsWith('/images/edits') ? stripped : `${stripped}/images/edits`;
+    return normalizeOpenAICompatiblePath(stripped, 'images', 'edits');
   }
-  const strippedPath = parsed.pathname.replace(/\/+$/, '');
-  if (!strippedPath.endsWith('/images/edits')) {
-    if (strippedPath.endsWith('/images/generations')) {
-      parsed.pathname = `${strippedPath.slice(0, -'/images/generations'.length)}/images/edits`;
-    } else {
-      parsed.pathname = `${strippedPath}/images/edits`;
-    }
-  }
+  parsed.pathname = normalizeOpenAICompatiblePath(parsed.pathname, 'images', 'edits');
   return parsed.toString();
 }
 
