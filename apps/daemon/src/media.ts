@@ -71,6 +71,7 @@ const execFile = promisify(execFileCb);
 type ProviderConfig = { apiKey?: string; baseUrl?: string; model?: string };
 type ProgressFn = (message: string) => void;
 type ImageRef = { path: string; abs: string; mime: string; size: number; dataUrl: string };
+type MediaRequestInit = Pick<RequestInit, 'dispatcher'>;
 type MediaContext = {
   surface: MediaSurface;
   /**
@@ -109,6 +110,7 @@ type MediaContext = {
   promptInfluence: number | undefined;
   compositionDir: string | null;
   imageRef: ImageRef | null;
+  requestInit: MediaRequestInit;
 };
 type RenderResult = { bytes: Buffer; providerNote: string; suggestedExt?: string };
 type JsonRecord = Record<string, unknown>;
@@ -286,7 +288,7 @@ export async function generateMedia(args: {
   projectRoot: string; projectsRoot: string; projectId: string; surface: MediaSurface; model: string;
   prompt?: string; output?: string; aspect?: string; length?: number; duration?: number; voice?: string;
   audioKind?: AudioKind; language?: string; loop?: boolean; promptInfluence?: number;
-  compositionDir?: string; image?: string; onProgress?: ProgressFn;
+  compositionDir?: string; image?: string; onProgress?: ProgressFn; requestInit?: MediaRequestInit;
 }) {
   const {
     projectRoot,
@@ -306,6 +308,7 @@ export async function generateMedia(args: {
     promptInfluence,
     compositionDir,
     image,
+    requestInit,
   } = args;
 
   if (!projectRoot) throw new Error('projectRoot required');
@@ -415,6 +418,7 @@ export async function generateMedia(args: {
     // Resolved reference image for i2v / image-edit flows. `null` when
     // the agent didn't pass --image. See resolveProjectImage below.
     imageRef,
+    requestInit: requestInit || {},
   };
 
   const credentials = await resolveProviderConfig(projectRoot, def.provider);
@@ -694,6 +698,16 @@ const openAIImageDispatcher = new UndiciAgent({
   bodyTimeout: OPENAI_IMAGE_BODY_TIMEOUT_MS,
 });
 
+function withMediaRequestInit(
+  ctx: Pick<MediaContext, 'requestInit'>,
+  init: RequestInit = {},
+): RequestInit {
+  return {
+    ...ctx.requestInit,
+    ...init,
+  };
+}
+
 async function renderOpenAIImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error('no OpenAI credential — configure an API key in Settings, set OPENAI_API_KEY, or refresh Codex/Hermes OAuth');
@@ -738,12 +752,14 @@ async function renderOpenAIImage(ctx: MediaContext, credentials: ProviderConfig)
     headers['api-key'] = credentials.apiKey;
   }
 
-  const resp = await fetch(url, {
+  const resp = await fetch(url, withMediaRequestInit(ctx, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-    dispatcher: openAIImageDispatcher as unknown as NonNullable<RequestInit['dispatcher']>,
-  });
+    dispatcher: ctx.requestInit.dispatcher
+      ?? openAIImageDispatcher as unknown as NonNullable<RequestInit['dispatcher']>,
+    signal: AbortSignal.timeout(Math.max(OPENAI_IMAGE_HEADERS_TIMEOUT_MS, OPENAI_IMAGE_BODY_TIMEOUT_MS)),
+  }));
   const text = await resp.text();
   if (!resp.ok) {
     const tag = azure ? 'azure-openai' : 'openai';
@@ -761,7 +777,7 @@ async function renderOpenAIImage(ctx: MediaContext, credentials: ProviderConfig)
   if (entry.b64_json) {
     bytes = Buffer.from(entry.b64_json, 'base64');
   } else if (entry.url) {
-    const imgResp = await fetch(entry.url);
+    const imgResp = await fetch(entry.url, withMediaRequestInit(ctx));
     if (!imgResp.ok) throw new Error(`openai image fetch ${imgResp.status}`);
     const arr = await imgResp.arrayBuffer();
     bytes = Buffer.from(arr);
@@ -795,16 +811,16 @@ async function renderImageRouterImage(ctx: MediaContext, credentials: ProviderCo
     output_format: 'png',
   };
 
-  const resp = await fetch(url, {
+  const resp = await fetch(url, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const data = await parseOpenAICompatibleJson(resp, 'imagerouter image');
-  const bytes = await bytesFromOpenAICompatibleData(data, 'imagerouter image');
+  const bytes = await bytesFromOpenAICompatibleData(data, 'imagerouter image', ctx.requestInit);
   return {
     bytes,
     providerNote: `imagerouter/${wireModel} · ${imageRouterSizeFor(ctx.aspect, 'image')} · ${bytes.length} bytes`,
@@ -830,16 +846,16 @@ async function renderImageRouterVideo(ctx: MediaContext, credentials: ProviderCo
     response_format: 'b64_json',
   };
 
-  const resp = await fetch(url, {
+  const resp = await fetch(url, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const data = await parseOpenAICompatibleJson(resp, 'imagerouter video');
-  const bytes = await bytesFromOpenAICompatibleData(data, 'imagerouter video');
+  const bytes = await bytesFromOpenAICompatibleData(data, 'imagerouter video', ctx.requestInit);
   return {
     bytes,
     providerNote: `imagerouter/${wireModel} · ${imageRouterSizeFor(ctx.aspect, 'video')} · ${seconds === 'auto' ? 'auto' : `${seconds}s`} · ${bytes.length} bytes`,
@@ -883,13 +899,13 @@ async function renderCustomOpenAIImage(ctx: MediaContext, credentials: ProviderC
     url = buildOpenAIImageEditUrl(baseUrl);
   }
 
-  const resp = await fetch(url, {
+  const resp = await fetch(url, withMediaRequestInit(ctx, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-  });
+  }));
   const data = await parseOpenAICompatibleJson(resp, 'custom image');
-  const bytes = await bytesFromOpenAICompatibleData(data, 'custom image');
+  const bytes = await bytesFromOpenAICompatibleData(data, 'custom image', ctx.requestInit);
   return {
     bytes,
     providerNote: `custom-image/${wireModel} · ${body.size} · ${bytes.length} bytes`,
@@ -919,7 +935,7 @@ async function parseOpenAICompatibleJson(resp: Response, providerTag: string): P
   }
 }
 
-async function bytesFromOpenAICompatibleData(data: any, providerTag: string): Promise<Buffer> {
+async function bytesFromOpenAICompatibleData(data: any, providerTag: string, requestInit: MediaRequestInit = {}): Promise<Buffer> {
   const entry = data && Array.isArray(data.data) ? data.data[0] : null;
   if (!entry) throw new Error(`${providerTag} response had no data[0]`);
   if (typeof entry.b64_json === 'string' && entry.b64_json) {
@@ -929,7 +945,7 @@ async function bytesFromOpenAICompatibleData(data: any, providerTag: string): Pr
     return Buffer.from(raw, 'base64');
   }
   if (typeof entry.url === 'string' && entry.url) {
-    const mediaResp = await fetch(entry.url);
+    const mediaResp = await fetch(entry.url, requestInit);
     if (!mediaResp.ok) {
       throw new Error(`${providerTag} media fetch ${mediaResp.status}`);
     }
@@ -1143,11 +1159,11 @@ async function renderOpenAISpeech(ctx: MediaContext, credentials: ProviderConfig
     headers['api-key'] = credentials.apiKey;
   }
 
-  const resp = await fetch(url, {
+  const resp = await fetch(url, withMediaRequestInit(ctx, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-  });
+  }));
   if (!resp.ok) {
     const text = await resp.text();
     const tag = azure ? 'azure-openai' : 'openai';
@@ -1221,14 +1237,14 @@ async function renderVolcengineVideo(ctx: MediaContext, credentials: ProviderCon
     content,
   };
 
-  const taskResp = await fetch(`${baseUrl}/contents/generations/tasks`, {
+  const taskResp = await fetch(`${baseUrl}/contents/generations/tasks`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(taskBody),
-  });
+  }));
   const taskText = await taskResp.text();
   if (!taskResp.ok) {
     throw new Error(`volcengine task create ${taskResp.status}: ${truncate(taskText, 240)}`);
@@ -1265,9 +1281,9 @@ async function renderVolcengineVideo(ctx: MediaContext, credentials: ProviderCon
   }
   while (Date.now() - startedAt < maxMs) {
     await sleep(4000);
-    const pollResp = await fetch(`${baseUrl}/contents/generations/tasks/${encodeURIComponent(taskId)}`, {
+    const pollResp = await fetch(`${baseUrl}/contents/generations/tasks/${encodeURIComponent(taskId)}`, withMediaRequestInit(ctx, {
       headers: { 'authorization': `Bearer ${credentials.apiKey}` },
-    });
+    }));
     const pollText = await pollResp.text();
     if (!pollResp.ok) {
       throw new Error(`volcengine poll ${pollResp.status}: ${truncate(pollText, 240)}`);
@@ -1300,7 +1316,7 @@ async function renderVolcengineVideo(ctx: MediaContext, credentials: ProviderCon
     throw new Error(`volcengine task did not finish in time (last status: ${lastStatus || 'unknown'})`);
   }
 
-  const dlResp = await fetch(videoUrl);
+  const dlResp = await fetch(videoUrl, withMediaRequestInit(ctx));
   if (!dlResp.ok) throw new Error(`volcengine video fetch ${dlResp.status}`);
   const arr = await dlResp.arrayBuffer();
   const bytes = Buffer.from(arr);
@@ -1339,14 +1355,14 @@ async function renderVolcengineImage(ctx: MediaContext, credentials: ProviderCon
     // wire name. lefarcen + codex P2 on PR #1309.
     size: openaiSizeFor(ctx.model, ctx.aspect),
   };
-  const resp = await fetch(`${baseUrl}/images/generations`, {
+  const resp = await fetch(`${baseUrl}/images/generations`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`volcengine image ${resp.status}: ${truncate(text, 240)}`);
@@ -1363,7 +1379,7 @@ async function renderVolcengineImage(ctx: MediaContext, credentials: ProviderCon
   if (entry.b64_json) {
     bytes = Buffer.from(entry.b64_json, 'base64');
   } else if (entry.url) {
-    const imgResp = await fetch(entry.url);
+    const imgResp = await fetch(entry.url, withMediaRequestInit(ctx));
     if (!imgResp.ok) throw new Error(`volcengine image fetch ${imgResp.status}`);
     bytes = Buffer.from(await imgResp.arrayBuffer());
   } else {
@@ -1410,14 +1426,14 @@ async function renderGrokImage(ctx: MediaContext, credentials: ProviderConfig): 
     aspect_ratio: aspectRatio,
     response_format: 'b64_json',
   };
-  const resp = await fetch(`${baseUrl}/images/generations`, {
+  const resp = await fetch(`${baseUrl}/images/generations`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`grok image ${resp.status}: ${truncate(text, 240)}`);
@@ -1434,7 +1450,7 @@ async function renderGrokImage(ctx: MediaContext, credentials: ProviderConfig): 
   if (entry.b64_json) {
     bytes = Buffer.from(entry.b64_json, 'base64');
   } else if (entry.url) {
-    const imgResp = await fetch(entry.url);
+    const imgResp = await fetch(entry.url, withMediaRequestInit(ctx));
     if (!imgResp.ok) throw new Error(`grok image fetch ${imgResp.status}`);
     bytes = Buffer.from(await imgResp.arrayBuffer());
   } else {
@@ -1476,11 +1492,11 @@ async function renderNanoBananaImage(ctx: MediaContext, credentials: ProviderCon
     },
   };
 
-  const resp = await fetch(`${baseUrl}/v1beta/models/${encodeURIComponent(wireModel)}:generateContent`, {
+  const resp = await fetch(`${baseUrl}/v1beta/models/${encodeURIComponent(wireModel)}:generateContent`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: nanoBananaHeaders(baseUrl, credentials.apiKey),
     body: JSON.stringify(body),
-  });
+  }));
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`nano-banana image ${resp.status}: ${truncate(text, 240)}`);
@@ -1617,14 +1633,14 @@ async function renderLeonardoImage(ctx: MediaContext, credentials: ProviderConfi
     ...(requiresContrast ? { contrast: 3.5 } : {}),
   };
   
-  const submitResp = await fetch(`${baseUrl}/generations`, {
+  const submitResp = await fetch(`${baseUrl}/generations`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   
   const submitText = await submitResp.text();
   if (!submitResp.ok) {
@@ -1652,11 +1668,11 @@ async function renderLeonardoImage(ctx: MediaContext, credentials: ProviderConfi
   while (Date.now() - startedAt < maxPollMs) {
     await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
     
-    const pollResp = await fetch(`${baseUrl}/generations/${generationId}`, {
+    const pollResp = await fetch(`${baseUrl}/generations/${generationId}`, withMediaRequestInit(ctx, {
       headers: {
         'authorization': `Bearer ${credentials.apiKey}`,
       },
-    });
+    }));
     
     if (!pollResp.ok) {
       throw new Error(`leonardo.ai poll ${pollResp.status}`);
@@ -1681,7 +1697,7 @@ async function renderLeonardoImage(ctx: MediaContext, credentials: ProviderConfi
   }
   
   // Fetch the generated image
-  const imgResp = await fetch(imageUrl);
+  const imgResp = await fetch(imageUrl, withMediaRequestInit(ctx));
   if (!imgResp.ok) {
     throw new Error(`leonardo.ai image fetch ${imgResp.status}`);
   }
@@ -1725,14 +1741,14 @@ async function renderGrokVideo(ctx: MediaContext, credentials: ProviderConfig, o
     body.image = ctx.imageRef.dataUrl;
   }
 
-  const submitResp = await fetch(`${baseUrl}/videos/generations`, {
+  const submitResp = await fetch(`${baseUrl}/videos/generations`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const submitText = await submitResp.text();
   if (!submitResp.ok) {
     throw new Error(`grok video submit ${submitResp.status}: ${truncate(submitText, 240)}`);
@@ -1765,9 +1781,9 @@ async function renderGrokVideo(ctx: MediaContext, credentials: ProviderConfig, o
     }
     while (Date.now() - startedAt < maxMs) {
       await sleep(4000);
-      const pollResp = await fetch(`${baseUrl}/videos/${encodeURIComponent(requestId)}`, {
+      const pollResp = await fetch(`${baseUrl}/videos/${encodeURIComponent(requestId)}`, withMediaRequestInit(ctx, {
         headers: { 'authorization': `Bearer ${credentials.apiKey}` },
-      });
+      }));
       const pollText = await pollResp.text();
       if (!pollResp.ok) {
         throw new Error(`grok poll ${pollResp.status}: ${truncate(pollText, 240)}`);
@@ -1819,7 +1835,7 @@ async function renderGrokVideo(ctx: MediaContext, credentials: ProviderConfig, o
     );
   }
 
-  const dlResp = await fetch(videoUrl);
+  const dlResp = await fetch(videoUrl, withMediaRequestInit(ctx));
   if (!dlResp.ok) throw new Error(`grok video fetch ${dlResp.status}`);
   const arr = await dlResp.arrayBuffer();
   const bytes = Buffer.from(arr);
@@ -1888,14 +1904,14 @@ async function renderXAITTS(ctx: MediaContext, credentials: ProviderConfig): Pro
     language,
   };
 
-  const resp = await fetch(`${baseUrl}/tts`, {
+  const resp = await fetch(`${baseUrl}/tts`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '');
     throw new Error(`xai tts ${resp.status}: ${truncate(errText, 240)}`);
@@ -1991,14 +2007,14 @@ async function renderElevenLabsTTS(ctx: MediaContext, credentials: ProviderConfi
 
   const resp = await fetch(
     `${baseUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
-    {
+    withMediaRequestInit(ctx, {
       method: 'POST',
       headers: {
         'xi-api-key': credentials.apiKey,
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),
-    },
+    }),
   );
   if (!resp.ok) {
     const errText = await resp.text();
@@ -2042,14 +2058,14 @@ async function renderElevenLabsSfx(ctx: MediaContext, credentials: ProviderConfi
 
   const resp = await fetch(
     `${baseUrl}/v1/sound-generation?output_format=mp3_44100_128`,
-    {
+    withMediaRequestInit(ctx, {
       method: 'POST',
       headers: {
         'xi-api-key': credentials.apiKey,
         'content-type': 'application/json',
       },
       body: JSON.stringify(body),
-    },
+    }),
   );
   if (!resp.ok) {
     const errText = await resp.text();
@@ -2133,14 +2149,14 @@ async function renderMinimaxTTS(ctx: MediaContext, credentials: ProviderConfig):
     },
   };
 
-  const resp = await fetch(`${baseUrl}/t2a_v2`, {
+  const resp = await fetch(`${baseUrl}/t2a_v2`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const respText = await resp.text();
   if (!resp.ok) {
     throw new Error(`minimax tts ${resp.status}: ${truncate(respText, 240)}`);
@@ -2238,14 +2254,14 @@ async function renderSenseAudioTTS(ctx: MediaContext, credentials: ProviderConfi
     },
   };
 
-  const resp = await fetch(`${baseUrl}/v1/t2a_v2`, {
+  const resp = await fetch(`${baseUrl}/v1/t2a_v2`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const respText = await resp.text();
   if (!resp.ok) {
     throw new Error(`senseaudio tts ${resp.status}: ${truncate(respText, 240)}`);
@@ -2349,14 +2365,14 @@ async function renderSenseAudioImage(ctx: MediaContext, credentials: ProviderCon
     body.reference = reference;
   }
 
-  const resp = await fetch(`${baseUrl}/v1/image/sync`, {
+  const resp = await fetch(`${baseUrl}/v1/image/sync`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   const respText = await resp.text();
   if (!resp.ok) {
     throw new Error(`senseaudio image ${resp.status}: ${truncate(respText, 240)}`);
@@ -2392,7 +2408,7 @@ async function renderSenseAudioImage(ctx: MediaContext, credentials: ProviderCon
   if (!urlCheck.ok) {
     throw new Error(`senseaudio image ${urlCheck.error}`);
   }
-  const imgResp = await fetch(url, { redirect: 'error' });
+  const imgResp = await fetch(url, withMediaRequestInit(ctx, { redirect: 'error' }));
   if (!imgResp.ok) {
     throw new Error(`senseaudio image fetch ${imgResp.status}`);
   }
@@ -2458,14 +2474,14 @@ async function renderFishAudioTTS(ctx: MediaContext, credentials: ProviderConfig
     body.reference_id = ctx.voice.trim();
   }
 
-  const resp = await fetch(`${baseUrl}/v1/tts`, {
+  const resp = await fetch(`${baseUrl}/v1/tts`, withMediaRequestInit(ctx, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${credentials.apiKey}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
-  });
+  }));
   if (!resp.ok) {
     const errText = await resp.text();
     throw new Error(`fishaudio tts ${resp.status}: ${truncate(errText, 240)}`);
